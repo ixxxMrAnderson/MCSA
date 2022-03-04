@@ -1,0 +1,6 @@
+inout uint64 x 1
+inout uint64 y 1
+inout uint64 z 1
+in uint64 a
+in uint64 b
+call word3_muladd

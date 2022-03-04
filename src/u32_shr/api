@@ -1,0 +1,2 @@
+inout uint64 input 4
+call u32_shr

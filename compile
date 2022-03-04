@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+
+compilerlist = (
+  #'clang -O1 -fwrapv -march=native',
+  'gcc -O3 -march=native -mtune=native',
+  # 'gcc',
+  # 'g++',
+)
+
+typebits = {
+  'int8': 8,
+  'int16': 16,
+  'int32': 32,
+  'int64': 64,
+  'uint8': 8,
+  'uint16': 16,
+  'uint32': 32,
+  'uint64': 64,
+}
+rusttype = {
+  'int8': 'i8',
+  'int16': 'i16',
+  'int32': 'i32',
+  'int64': 'i64',
+  'uint8': 'u8',
+  'uint16': 'u16',
+  'uint32': 'u32',
+  'uint64': 'u64',
+}
+
+import sys
+import os
+import shutil
+import subprocess
+import angr
+import claripy
+import multiprocessing
+import random
+import traceback
+import functools
+
+
+# ----- performance-related configuration...
+
+numrandomtests = 16
+# test 16 random inputs to each function
+# (first two are all-0, all-1)
+# of course more time on testing and fuzzing would be useful
+
+maxsplit = 100000
+# max number of universes within an angr run
+# XXX: allow per-primitive/per-implementation configuration
+
+satvalidation1 = False
+# True would mean: even if random tests fail, invoke general sat/unsat mechanism
+# this is for extra validation of that mechanism
+
+claripy.simplifications.simpleton._simplifiers = {
+  'Reverse': claripy.simplifications.simpleton.bv_reverse_simplifier,
+  'Extract': claripy.simplifications.simpleton.extract_simplifier,
+  'Concat': claripy.simplifications.simpleton.concat_simplifier,
+  'ZeroExt': claripy.simplifications.simpleton.zeroext_simplifier,
+  'SignExt': claripy.simplifications.simpleton.signext_simplifier,
+}
+# this is somewhat ad-hoc monkey-patching
+# underlying problem: flatten simplifiers can easily blow up
+
+sys.setrecursionlimit(1000000)
+
+
+# ----- real work begins here
+
+z3timeout = 2**32-1
+# XXX: by default claripy satisfiable() has 5-minute timeout
+# and indicates timeout by returning False
+# current Z3 documentation says:
+# timeout (in milliseconds) (UINT_MAX and 0 mean no timeout)
+
+try:
+  os_cores = len(os.sched_getaffinity(0))
+except AttributeError:
+  os_cores = multiprocessing.cpu_count()
+os_cores = os.getenv('CORES',default=os_cores)
+os_cores = int(os_cores)
+if os_cores < 1: os_cores = 1
+
+import resource
+def cputime():
+  return resource.getrusage(resource.RUSAGE_SELF).ru_utime + resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
+
+def notetime(builddir,what,time):
+  print('%s seconds %s %.6f' % (builddir,what,time))
+  sys.stdout.flush()
+  with open('%s/analysis/seconds' % builddir,'a') as f:
+    f.write('%s %.6f\n' % (what,time))
+
+def note(builddir,conclusion,contents=None):
+  print('%s %s' % (builddir,conclusion))
+  sys.stdout.flush()
+  with open('%s/analysis/%s' % (builddir,conclusion),'w') as f:
+    if contents != None:
+      f.write(str(contents))
+
+startdir = os.getcwd()
+assert all(x in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./' for x in startdir)
+shutil.rmtree('build',ignore_errors=True)
+os.makedirs('build')
+
+
+primitives = []
+
+for o in 'src',:
+  o = o.strip()
+  if o == '': continue
+  if not os.path.isdir(o): continue
+  if os.stat('%s' % o).st_mode & 0o1000 == 0o1000:
+    print('%s sticky, skipping' % o)
+    sys.stdout.flush()
+    continue
+
+  for p in sorted(os.listdir(o)):
+    if not os.path.isdir('%s/%s' % (o,p)): continue
+    if os.stat('%s/%s' % (o,p)).st_mode & 0o1000 == 0o1000:
+      print('%s/%s sticky, skipping' % (o,p))
+      sys.stdout.flush()
+      continue
+    if not os.path.exists('%s/%s/api' % (o,p)):
+      print('%s/%s/api nonexistent, skipping' % (o,p))
+      sys.stdout.flush()
+      continue
+
+    primitives += [(o,p)]
+
+
+op_api = {}
+
+for o,p in primitives:
+  inputs = []
+  outputs = []
+  funargs = []
+  funargtypes = []
+  rustargs = []
+  rustargtypes = []
+  crustargs = []
+  crustargtypes = []
+  funname = None
+  funret = None
+  funrettype = 'void'
+
+  with open('%s/%s/api' % (o,p)) as f:
+    for line in f:
+      line = line.split()
+      if len(line) == 0: continue
+
+      if line[0] == 'call':
+        funname = line[1]
+        assert all(x in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_' for x in funname)
+
+      if line[0] == 'return':
+        symboltype = line[1]
+        csymbol = line[2]
+        assert all(c in 'abcdefghijklmnopqrstuvwxyz' for c in csymbol)
+        entries = 1
+        outputs += [(csymbol,symboltype,entries)]
+        funret = 'alloc_%s'%csymbol
+        funrettype = 'uint%d_t'%typebits[symboltype]
+
+      if line[0] in ('in','out','inout'):
+        symboltype = line[1]
+        csymbol = line[2]
+        assert all(c in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_' for c in csymbol)
+        if len(line) == 3:
+          pointer = False
+          entries = 1
+        else:
+          pointer = True
+          entries = int(line[3])
+        if line[0] in ('in','inout'):
+          inputs += [(csymbol,symboltype,entries)]
+        if line[0] in ('out','inout'):
+          outputs += [(csymbol,symboltype,entries)]
+        if pointer:
+          funargs += ['alloc_%s'%csymbol]
+          funargtypes += ['uint%d_t *' % typebits[symboltype]]
+          crustargs += ['c_%s'%csymbol]
+          rustargs += ['rust_%s'%csymbol]
+          if line[0] == 'in':
+            crustargtypes += ['*const %s' % rusttype[symboltype]]
+          else:
+            crustargtypes += ['*mut %s' % rusttype[symboltype]]
+        else:
+          funargs += ['*alloc_%s'%csymbol]
+          funargtypes += ['uint%d_t' % typebits[symboltype]]
+          crustargs += ['c_%s'%csymbol]
+          rustargs += ['rust_%s'%csymbol]
+          crustargtypes += ['const %s' % rusttype[symboltype]]
+
+      # XXX: support constant inputs
+
+  op_api[o,p] = inputs,outputs,funargs,funargtypes,crustargs,crustargtypes,rustargs,funname,funret,funrettype
+
+
+def input_example_str(inputs,x):
+  xstr = ''
+  xpos = 0
+  for csymbol,symboltype,entries in inputs:
+    for e in range(entries):
+      varname = 'in_%s_%d'%(csymbol,e)
+      xstr += '%s = %d\n' % (varname,x[xpos])
+      xpos += 1
+  assert xpos == len(x)
+  return xstr
+
+def output_example_str(outputs,y):
+  ystr = ''
+  ypos = 0
+  for csymbol,symboltype,entries in outputs:
+    for e in range(entries):
+      varname = 'out_%s_%d'%(csymbol,e)
+      ystr += '%s = %d\n' % (varname,y[ypos])
+      ypos += 1
+  assert ypos == len(y)
+  return ystr
+
+
+reservedfilenames = (
+  'library.so.1',
+  'analysis',
+  'analysis-execute',
+  'analysis-execute.c',
+  'analysis-valgrind',
+  'analysis-valgrind.c',
+  'analysis-angr',
+  'analysis-angr.c',
+)
+
+opimplementations = {}
+
+for o,p in primitives:
+  opimplementations[o,p] = []
+  for i in sorted(os.listdir('%s/%s' % (o,p))):
+    implementationdir = '%s/%s/%s' % (o,p,i)
+    if not os.path.isdir(implementationdir): continue
+    if os.stat(implementationdir).st_mode & 0o1000 == 0o1000:
+      print('%s/%s/%s sticky, skipping' % (o,p,i))
+      continue
+
+    files = sorted(os.listdir(implementationdir))
+    # note(implementationdir, "test")
+    for f in files:
+      ok = True
+      if f in reservedfilenames:
+        # note(builddir, "reservedfilenames")
+        print('%s/%s/%s/%s reserved filename' % (o,p,i,f))
+        ok = False
+      if any(fi not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for fi in f):
+        # note(builddir, "prohibited")
+        print('%s/%s/%s/%s prohibited character' % (o,p,i,f))
+        ok = False
+    if not ok: continue
+
+    opimplementations[o,p] += [i]
+
+  for compiler in compilerlist:
+    # note()
+    compilerword = compiler.replace(' ','_').replace('=','_')
+    builddir = 'build/%s/%s/%s' % (p,i,compilerword)
+    # note(builddir, "test")
+    os.makedirs('build/%s/%s' % (p,i),exist_ok=True)
+
+
+
+def compile(o,p,i,compiler):
+  compilerword = compiler.replace(' ','_').replace('=','_')
+  implementationdir = '%s/%s/%s' % (o,p,i)
+  builddir = 'build/%s/%s/%s' % (p,i,compilerword)
+  inputs,outputs,funargs,funargtypes,crustargs,crustargtypes,rustargs,funname,funret,funrettype = op_api[o,p]
+
+  files = sorted(os.listdir(implementationdir))
+  rust = 'Cargo.toml' in files
+  rustlocked = 'Cargo.lock' in files
+
+  cfiles = [x for x in files if x.endswith('.c')]
+  sfiles = [x for x in files if x.endswith('.s') or x.endswith('.S')]
+  files = cfiles + sfiles
+
+  shutil.copytree(implementationdir,builddir)
+  os.makedirs('%s/analysis' % builddir)
+
+  for bits in 8,16,32,64:
+    with open('%s/crypto_int%d.h' % (builddir,bits),'w') as f:
+      f.write('#include <inttypes.h>\n')
+      f.write('#define crypto_int%d int%d_t' % (bits,bits))
+    with open('%s/crypto_uint%d.h' % (builddir,bits),'w') as f:
+      f.write('#include <inttypes.h>\n')
+      f.write('#define crypto_uint%d uint%d_t' % (bits,bits))
+
+  for analysis in 'execute','valgrind','angr':
+    with open('%s/analysis-%s.c' % (builddir,analysis),'w') as f:
+      f.write('#include <stdio.h>\n')
+      f.write('#include <stdlib.h>\n')
+      f.write('#include <string.h>\n')
+      f.write('#include <inttypes.h>\n')
+      f.write('\n')
+  
+      # function declaration
+      f.write('extern ')
+      if funrettype != None:
+        f.write('%s ' % funrettype)
+      f.write('%s(%s);\n' % (funname,','.join(funargtypes)))
+      f.write('\n')
+  
+      for csymbol,symboltype,entries in inputs:
+        f.write('uint%d_t static_%s[%d];\n' % (typebits[symboltype],csymbol,entries))
+      for csymbol,symboltype,entries in outputs:
+        if (csymbol,symboltype,entries) not in inputs:
+          f.write('uint%d_t static_%s[%d];\n' % (typebits[symboltype],csymbol,entries))
+      f.write('\n')
+      f.write('int main(int argc,char **argv)\n')
+      f.write('{\n')
+      for csymbol,symboltype,entries in inputs:
+        f.write('  uint%d_t *alloc_%s = malloc(%d);\n' % (typebits[symboltype],csymbol,entries*typebits[symboltype]/8))
+      for csymbol,symboltype,entries in outputs:
+        if (csymbol,symboltype,entries) not in inputs:
+          f.write('  uint%d_t *alloc_%s = malloc(%d);\n' % (typebits[symboltype],csymbol,entries*typebits[symboltype]/8))
+      f.write('\n')
+  
+      # XXX: resource limits
+  
+      if analysis == 'execute':
+        for csymbol,symboltype,entries in inputs:
+          f.write('  for (long long i = 0;i < %d;++i) {\n' % entries)
+          f.write('    unsigned long long x;\n')
+          f.write('    if (scanf("%llu",&x) != 1) abort();\n')
+          f.write('    static_%s[i] = x;\n' % csymbol)
+          f.write('  }\n')
+        f.write('\n')
+  
+      if analysis in ('execute','angr'):
+        for csymbol,symboltype,entries in inputs:
+          f.write('  for (long long i = 0;i < %d;++i)\n' % entries)
+          f.write('    alloc_%s[i] = static_%s[i];\n' % (csymbol,csymbol))
+        f.write('\n')
+  
+      f.write('  ')
+      if funret != None:
+        f.write('%s[0] = ' % funret)
+      f.write('%s(%s);\n' % (funname,','.join(funargs)))
+      f.write('\n')
+  
+      if analysis in ('execute','angr'):
+        for csymbol,symboltype,entries in outputs:
+          f.write('  for (long long i = 0;i < %d;++i)\n' % entries)
+          f.write('    static_%s[i] = alloc_%s[i];\n' % (csymbol,csymbol))
+        f.write('\n')
+  
+      if analysis == 'execute':
+        for csymbol,symboltype,entries in outputs:
+          f.write('  for (long long i = 0;i < %d;++i) {\n' % entries)
+          f.write('    unsigned long long x = static_%s[i];\n' % csymbol)
+          f.write('    printf("%llu\\n",x);\n')
+          f.write('  }\n')
+          f.write('  fflush(stdout);\n')
+        f.write('\n')
+  
+      f.write('  return 0;\n')
+      f.write('}\n')
+
+  # ----- rust
+
+  if rust:
+    os.makedirs('%s/src/bin'%builddir,exist_ok=True)
+
+    with open('%s/Cargo.toml'%builddir,'a') as f:
+      f.write("""\
+
+[build-dependencies]
+cc = { git = "https://github.com/alexcrichton/cc-rs", version = "1.0.67", rev = "3283434ee41f2a1be6c78fe6d6a3ec8eb92b1833" }
+
+[[bin]]
+name = "analysis-execute"
+
+[[bin]]
+name = "analysis-valgrind"
+
+[[bin]]
+name = "analysis-angr"
+
+[profile.release]
+panic = "abort"
+""")
+
+    with open('%s/build.rs'%builddir,'w') as f:
+      f.write("""\
+use std::env;
+
+fn main() {
+  let out_dir = env::var("OUT_DIR").unwrap();
+  println!("cargo:rustc-link-search=native={}",out_dir);
+  cc::Build::new()
+    .cargo_metadata(false)
+    .file("analysis-execute.c")
+    .compile("analysis-execute");
+  println!("cargo:rerun-if-changed=analysis-execute.c");
+  cc::Build::new()
+    .cargo_metadata(false)
+    .file("analysis-valgrind.c")
+    .compile("analysis-valgrind");
+  println!("cargo:rerun-if-changed=analysis-valgrind.c");
+  cc::Build::new()
+    .cargo_metadata(false)
+    .file("analysis-angr.c")
+    .compile("analysis-angr");
+  println!("cargo:rerun-if-changed=analysis-angr.c");
+}
+""")
+    
+    for analysis in 'execute','valgrind','angr':
+      with open('%s/src/bin/analysis-%s.rs'%(builddir,analysis),'w') as f:
+        f.write('#![no_std]\n')
+        f.write('#![no_main]\n')
+        f.write('extern crate %s;\n'%funname)
+        f.write('\n')
+        f.write('use core::convert::TryInto;\n')
+        f.write('use core::slice;\n')
+        f.write('\n')
+        f.write('#[link(name="analysis-%s")]\n'%analysis)
+        f.write('extern {\n')
+        f.write('#[allow(dead_code)]\n')
+        f.write('  fn main() -> i32;\n')
+        f.write('}\n')
+        f.write('\n')
+        f.write('#[no_mangle]\n')
+        f.write('pub unsafe extern "C"\n')
+        f.write('fn %s(\n'%funname)
+        for arg,argtype in zip(crustargs,crustargtypes):
+          f.write('  %s:%s,\n' % (arg,argtype))
+        f.write(') -> i32 {\n')
+
+        for csymbol,symboltype,entries in outputs:
+          f.write('  let rust_%s = slice::from_raw_parts_mut(c_%s,%d);\n' % (csymbol,csymbol,entries))
+          f.write('  let rust_%s:&mut[%s;%d] = rust_%s.try_into().unwrap();\n' % (csymbol,rusttype[symboltype],entries,csymbol))
+
+        for csymbol,symboltype,entries in inputs:
+          if (csymbol,symboltype,entries) not in outputs:
+            f.write('  let rust_%s = slice::from_raw_parts(c_%s,%d);\n' % (csymbol,csymbol,entries))
+
+        f.write('  %s::%s(%s);\n' % (funname,funname,','.join(rustargs)))
+        # XXX: return value
+        f.write('  0\n')
+
+        f.write('}\n')
+
+    cargotime = -cputime()
+
+    env = os.environ
+    env['CC'] = compiler.split()[0]
+    env['CFLAGS'] = ' '.join(compiler.split()[1:])
+    env['RUSTFLAGS'] = '-C target_cpu=native -C link-args=-no-pie' # XXX: let user control this?
+    if rustlocked:
+      command = 'cargo build -q --locked --release --bin analysis-execute --bin analysis-valgrind --bin analysis-angr'
+    else:
+      command = 'cargo build -q --release --bin analysis-execute --bin analysis-valgrind --bin analysis-angr'
+
+    try:
+      proc = subprocess.Popen(command.split(),cwd=builddir,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True)
+      out,err = proc.communicate()
+    except OSError:
+      note(builddir,'warning-cargofailed',traceback.format_exc())
+      return o,p,i,compiler,False
+
+    assert not err
+    if out != '':
+      note(builddir,'warning-cargooutput',out)
+    if proc.returncode:
+      note(builddir,'warning-cargofailed','exit code %s' % proc.returncode)
+      return o,p,i,compiler,False
+
+    for analysis in 'execute','valgrind','angr':
+      shutil.copy('%s/target/release/analysis-%s'%(builddir,analysis),'%s/analysis-%s'%(builddir,analysis))
+
+    cargotime += cputime()
+    notetime(builddir,'cargo',cargotime)
+
+    return o,p,i,compiler,True
+
+  # ----- compile
+
+  compiletime = -cputime()
+
+  objfiles = []
+
+  for f in files+['analysis-execute.c','analysis-valgrind.c','analysis-angr.c']:
+    command = '%s -Wall -fPIC -DCRYPTO_NAMESPACE(x)=x -c %s' % (compiler,f)
+
+    try:
+      proc = subprocess.Popen(command.split(),cwd=builddir,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True)
+      out,err = proc.communicate()
+    except OSError:
+      note(builddir,'warning-compilefailed-%s'%f,traceback.format_exc())
+      return o,p,i,compiler,False
+      
+    assert not err
+    if out != '':
+      note(builddir,'warning-compileoutput-%s'%f,out)
+    if proc.returncode:
+      note(builddir,'warning-compilefailed-%s'%f,'exit code %s' % proc.returncode)
+      return o,p,i,compiler,False
+
+    if f in files:
+      objfiles += ['.'.join(f.split('.')[:-1]+['o'])]
+
+  compiletime += cputime()
+  notetime(builddir,'compile',compiletime)
+
+  # ----- link into executable
+
+  linktime = -cputime()
+
+  for analysis in 'execute','valgrind','angr':
+    static = True
+  
+    if static:
+      command = 'gcc -march=native -no-pie -o analysis-%s analysis-%s.o' % (analysis,analysis)
+      command = command.split()
+      command += objfiles
+  
+    else:
+      command = 'gcc -march=native -shared -Wl,-soname,library.so.1 -o library.so.1'
+      command = command.split()
+      command += objfiles
+  
+      try:
+        proc = subprocess.Popen(command,cwd=builddir,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True)
+        out,err = proc.communicate()
+      except OSError:
+        note(builddir,'warning-linkfailed-%s'%analysis,traceback.format_exc())
+        return o,p,i,compiler,False
+  
+      if out != '':
+        note(builddir,'warning-linkoutput-%s'%analysis,out)
+      assert not err
+      if proc.returncode:
+        note(builddir,'warning-linkfailed-%s'%analysis,'exit code %s' % proc.returncode)
+        return o,p,i,compiler,False
+  
+      shutil.copy('%s/library.so.1' % builddir,'%s/library.so' % builddir)
+  
+      command = 'gcc -march=native -no-pie -o analysis-%s analysis-%s.o -Wl,-rpath=%s/%s -L. -lrary' % (analysis,analysis,startdir,builddir)
+      command = command.split()
+  
+    try:
+      proc = subprocess.Popen(command,cwd=builddir,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,universal_newlines=True)
+      out,err = proc.communicate()
+    except OSError:
+      note(builddir,'warning-linkfailed-%s'%analysis,traceback.format_exc())
+      return o,p,i,compiler,False
+  
+    if out != '':
+      note(builddir,'warning-linkoutput-%s'%analysis,out)
+    assert not err
+    if proc.returncode:
+      note(builddir,'warning-linkfailed-%s'%analysis,'exit code %s' % proc.returncode)
+      return o,p,i,compiler,False
+
+  linktime += cputime()
+  notetime(builddir,'link',linktime)
+
+  return o,p,i,compiler,True
+
+def wanttocompile():
+  for o,p in primitives:
+    for i in opimplementations[o,p]:
+      for compiler in compilerlist:
+        yield o,p,i,compiler
+
+op_compiled = {}
+for o,p in primitives:
+  op_compiled[o,p] = []
+
+with multiprocessing.Pool(os_cores) as pool:
+  for o,p,i,compiler,ok in pool.starmap(compile,wanttocompile()):
+    if not ok: continue
+    op_compiled[o,p] += [(i,compiler)]
+

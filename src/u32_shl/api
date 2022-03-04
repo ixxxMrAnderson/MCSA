@@ -1,0 +1,2 @@
+inout uint64 r 4
+call u32_shl

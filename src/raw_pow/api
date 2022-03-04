@@ -1,0 +1,3 @@
+in uint64 a 4
+inout uint64 result 8
+call raw_pow

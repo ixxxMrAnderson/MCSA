@@ -1,0 +1,3 @@
+call SM4_T
+in uint32 x
+return uint32 z

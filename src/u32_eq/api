@@ -1,0 +1,4 @@
+in uint64 a 4
+in uint64 b 4
+call u32_ge
+ret uint32 x
